@@ -1,0 +1,68 @@
+name: Update Slop PR Report
+
+on:
+  schedule:
+    # Run hourly
+    - cron: "0 * * * *"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action/setup@v1
+
+      - name: Build slopstats
+        run: cargo build --release
+
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: slopstats-data-${{ github.run_id }}
+          restore-keys: |
+            slopstats-data-
+
+      - name: Discover PRs
+        run: cargo run --release -- discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Fetch PR details
+        run: cargo run --release -- fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Generate report
+        run: cargo run --release -- analyze
+
+      - name: Prepare pages artifact
+        run: |
+          mkdir -p _site
+          cp data/report.html _site/index.html
+
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
