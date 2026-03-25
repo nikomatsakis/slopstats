@@ -1,6 +1,8 @@
 name: Update Slop PR Report
 
 on:
+  push:
+    branches: [main]
   schedule:
     # Run hourly
     - cron: "0 * * * *"
