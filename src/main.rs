@@ -580,6 +580,19 @@ fn tier_color(tier: ModerationTier) -> &'static str {
     }
 }
 
+/// Compute days between two "YYYY-MM-DD" date strings. Approximate but fine for display.
+fn days_between(earlier: &str, later: &str) -> Option<i64> {
+    fn to_days(date: &str) -> Option<i64> {
+        let parts: Vec<i64> = date.split('-').filter_map(|p| p.parse().ok()).collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        // Rough days since epoch — good enough for differences
+        Some(parts[0] * 365 + parts[1] * 30 + parts[2])
+    }
+    Some(to_days(later)? - to_days(earlier)?)
+}
+
 fn analyze(data_dir: &Path) -> Result<()> {
     let prs = load_prs(data_dir)?;
     let anon = build_anon_map(&prs);
@@ -589,7 +602,7 @@ fn analyze(data_dir: &Path) -> Result<()> {
     // --- Build chart data ---
 
     // 1. Timeline by week, stacked by tier
-    let mut weeks: BTreeMap<String, [u64; 4]> = BTreeMap::new(); // [ban, warning, soft, unknown]
+    let mut weeks: BTreeMap<String, [u64; 4]> = BTreeMap::new();
     for pr in &prs {
         if pr.created_at.len() >= 10 {
             let week = week_of(&pr.created_at[..10]);
@@ -607,17 +620,35 @@ fn analyze(data_dir: &Path) -> Result<()> {
     let week_warnings: Vec<u64> = weeks.values().map(|c| c[1]).collect();
     let week_soft: Vec<u64> = weeks.values().map(|c| c[2]).collect();
 
-    // 2. PR sizes
-    let size_labels: Vec<String> = prs
+    // 2. Per-PR data for size chart, rust PRs chart, account age chart (all tier-colored)
+    let pr_labels: Vec<String> = prs.iter().map(|pr| anon[&pr.author].clone()).collect();
+    let pr_colors: Vec<&str> = prs
         .iter()
-        .map(|pr| format!("{}", anon[&pr.author]))
+        .map(|pr| tier_color(pr.moderation_tier))
         .collect();
-    let size_additions: Vec<u64> = prs.iter().map(|pr| pr.additions).collect();
-    let size_deletions: Vec<u64> = prs.iter().map(|pr| pr.deletions).collect();
-    let size_tiers: Vec<&str> = prs.iter().map(|pr| tier_str(pr.moderation_tier)).collect();
+    let size_totals: Vec<u64> = prs.iter().map(|pr| pr.additions + pr.deletions).collect();
+    let rust_pr_counts: Vec<u64> = prs
+        .iter()
+        .map(|pr| pr.author_stats.rust_prs.unwrap_or(0))
+        .collect();
+    let account_ages: Vec<i64> = prs
+        .iter()
+        .map(|pr| {
+            pr.author_stats
+                .account_created
+                .as_deref()
+                .and_then(|created| {
+                    if created.len() >= 10 && pr.created_at.len() >= 10 {
+                        days_between(&created[..10], &pr.created_at[..10])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        })
+        .collect();
 
-    // 3. Author activity: recent_7d_prs vs recent_7d_repos (scatter)
-    // Deduplicate by author (use most recent PR's stats)
+    // 3. Author activity scatter — deduplicate by author, color by tier
     let mut author_scatter: BTreeMap<String, (u64, u64, ModerationTier)> = BTreeMap::new();
     for pr in &prs {
         let label = anon[&pr.author].clone();
@@ -625,19 +656,50 @@ fn analyze(data_dir: &Path) -> Result<()> {
         let recent_repos = pr.author_stats.recent_distinct_repos.unwrap_or(0);
         author_scatter.insert(label, (recent_prs, recent_repos, pr.moderation_tier));
     }
+    // Group scatter points by tier so the legend shows tiers, not individual authors
+    let mut scatter_by_tier: BTreeMap<&str, Vec<serde_json::Value>> = BTreeMap::new();
+    for (label, (prs_count, repos, tier)) in &author_scatter {
+        let tier_name = tier_str(*tier);
+        scatter_by_tier
+            .entry(tier_name)
+            .or_default()
+            .push(serde_json::json!({
+                "x": prs_count,
+                "y": repos,
+                "r": (*prs_count as f64).sqrt().mul_add(2.0, 0.0).max(5.0).min(40.0),
+                "label": label,
+            }));
+    }
 
     // 4. Summary table data
     let table_rows: Vec<String> = prs
         .iter()
         .map(|pr| {
             let s = &pr.author_stats;
-            let account_age = s
+            let account_created = s
                 .account_created
                 .as_deref()
                 .map(|d| &d[..10])
                 .unwrap_or("?");
+            let age_days = pr
+                .author_stats
+                .account_created
+                .as_deref()
+                .and_then(|created| {
+                    if created.len() >= 10 && pr.created_at.len() >= 10 {
+                        days_between(&created[..10], &pr.created_at[..10])
+                    } else {
+                        None
+                    }
+                });
+            let age_str = match age_days {
+                Some(d) if d < 30 => format!("{d}d"),
+                Some(d) if d < 365 => format!("{}mo", d / 30),
+                Some(d) => format!("{}y", d / 365),
+                None => "?".to_string(),
+            };
             format!(
-                r#"["{}", "{}", "{}", +{}, -{}, {}, {}, {}, {}, "{}", "{}"]"#,
+                r#"["{}", "{}", "{}", {}, {}, {}, {}, {}, {}, "{}", "{}", "{}"]"#,
                 anon[&pr.author],
                 &pr.created_at[..10],
                 tier_str(pr.moderation_tier),
@@ -647,7 +709,8 @@ fn analyze(data_dir: &Path) -> Result<()> {
                 s.recent_prs.unwrap_or(0),
                 s.recent_distinct_repos.unwrap_or(0),
                 s.rust_prs.unwrap_or(0),
-                account_age,
+                account_created,
+                age_str,
                 tier_color(pr.moderation_tier),
             )
         })
@@ -659,7 +722,7 @@ fn analyze(data_dir: &Path) -> Result<()> {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Slop PR Stats — rust-lang/rust</title>
+<title>Moderation Action Stats — rust-lang/rust</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
   body {{ font-family: system-ui, -apple-system, sans-serif; max-width: 1200px; margin: 0 auto; padding: 2rem; background: #fafafa; color: #333; }}
@@ -667,6 +730,8 @@ fn analyze(data_dir: &Path) -> Result<()> {
   h2 {{ margin-top: 2.5rem; color: #555; }}
   .chart-container {{ background: white; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
   canvas {{ max-height: 400px; }}
+  .two-charts {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }}
+  .two-charts .chart-container {{ margin: 0; }}
   table {{ border-collapse: collapse; width: 100%; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
   th {{ background: #34495e; color: white; padding: 0.75rem; text-align: left; font-size: 0.85rem; }}
   td {{ padding: 0.6rem 0.75rem; border-bottom: 1px solid #eee; font-size: 0.85rem; }}
@@ -676,11 +741,12 @@ fn analyze(data_dir: &Path) -> Result<()> {
   .stat-card {{ background: white; border-radius: 8px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); min-width: 150px; text-align: center; }}
   .stat-card .number {{ font-size: 2rem; font-weight: 700; }}
   .stat-card .label {{ color: #777; font-size: 0.85rem; margin-top: 0.25rem; }}
+  .legend-hint {{ font-size: 0.85rem; color: #888; margin-top: -0.5rem; }}
 </style>
 </head>
 <body>
-<h1>Slop PR Stats</h1>
-<p>Moderated PRs in <code>rust-lang/rust</code>. Data anonymized — authors shown as "Author A", "Author B", etc.</p>
+<h1>Moderation Action Stats</h1>
+<p>Moderated PRs in <code>rust-lang/rust</code>. Data anonymized. Colors: <span style="color:#e74c3c;font-weight:600">Ban</span> · <span style="color:#f39c12;font-weight:600">Warning</span> · <span style="color:#3498db;font-weight:600">Soft Close</span></p>
 
 <div class="summary">
   <div class="stat-card"><div class="number">{total}</div><div class="label">Total PRs</div></div>
@@ -692,99 +758,136 @@ fn analyze(data_dir: &Path) -> Result<()> {
 <h2>Moderation Actions Over Time</h2>
 <div class="chart-container"><canvas id="timelineChart"></canvas></div>
 
-<h2>PR Size (Additions + Deletions)</h2>
+<h2>PR Size (lines changed)</h2>
 <div class="chart-container"><canvas id="sizeChart"></canvas></div>
 
-<h2>Author Activity (7 days before moderated PR)</h2>
-<p>Each bubble is one author. X = PRs opened in 7-day window, Y = distinct repos targeted. Larger bubbles = more PRs.</p>
+<div class="two-charts">
+  <div>
+    <h2>Prior rust-lang/rust PRs</h2>
+    <div class="chart-container"><canvas id="rustPrChart"></canvas></div>
+  </div>
+  <div>
+    <h2>Account Age at PR Time</h2>
+    <div class="chart-container"><canvas id="ageChart"></canvas></div>
+  </div>
+</div>
+
+<h2>Author Spray Pattern (7 days before moderated PR)</h2>
+<p class="legend-hint">X = PRs opened across all of GitHub, Y = distinct repos. Bubble size = PR count.</p>
 <div class="chart-container"><canvas id="scatterChart"></canvas></div>
 
 <h2>Details</h2>
 <table>
-<thead><tr><th>Author</th><th>Date</th><th>Action</th><th>+/-</th><th>Total PRs</th><th>7d PRs</th><th>7d Repos</th><th>Rust PRs</th><th>Account Created</th></tr></thead>
+<thead><tr><th>Author</th><th>Date</th><th>Action</th><th>+</th><th>-</th><th>Total PRs</th><th>7d PRs</th><th>7d Repos</th><th>Rust PRs</th><th>Acct Age</th></tr></thead>
 <tbody id="tableBody"></tbody>
 </table>
 
 <script>
-const weekLabels = {week_labels_json};
-const weekBans = {week_bans_json};
-const weekWarnings = {week_warnings_json};
-const weekSoft = {week_soft_json};
+const TIER_COLORS = {{ Ban: '#e74c3c', Warning: '#f39c12', 'Soft Close': '#3498db', Unknown: '#95a5a6' }};
 
+// --- Timeline ---
 new Chart(document.getElementById('timelineChart'), {{
   type: 'bar',
   data: {{
-    labels: weekLabels,
+    labels: {week_labels_json},
     datasets: [
-      {{ label: 'Bans', data: weekBans, backgroundColor: '#e74c3c' }},
-      {{ label: 'Warnings', data: weekWarnings, backgroundColor: '#f39c12' }},
-      {{ label: 'Soft Closes', data: weekSoft, backgroundColor: '#3498db' }},
+      {{ label: 'Bans', data: {week_bans_json}, backgroundColor: '#e74c3c' }},
+      {{ label: 'Warnings', data: {week_warnings_json}, backgroundColor: '#f39c12' }},
+      {{ label: 'Soft Closes', data: {week_soft_json}, backgroundColor: '#3498db' }},
     ]
   }},
   options: {{
     responsive: true,
     scales: {{ x: {{ stacked: true }}, y: {{ stacked: true, beginAtZero: true, ticks: {{ stepSize: 1 }} }} }},
-    plugins: {{ title: {{ display: true, text: 'Moderation actions per week' }} }}
+    plugins: {{ legend: {{ display: false }} }}
   }}
 }});
 
-const sizeLabels = {size_labels_json};
-const sizeAdd = {size_add_json};
-const sizeDel = {size_del_json};
-const sizeTiers = {size_tiers_json};
-
+// --- PR Size ---
 new Chart(document.getElementById('sizeChart'), {{
   type: 'bar',
   data: {{
-    labels: sizeLabels.map((l, i) => l + ' (' + sizeTiers[i] + ')'),
-    datasets: [
-      {{ label: 'Additions', data: sizeAdd, backgroundColor: '#2ecc71' }},
-      {{ label: 'Deletions', data: sizeDel, backgroundColor: '#e74c3c' }},
-    ]
+    labels: {pr_labels_json},
+    datasets: [{{ data: {size_totals_json}, backgroundColor: {pr_colors_json} }}]
   }},
   options: {{
     responsive: true,
-    scales: {{ y: {{ type: 'logarithmic', beginAtZero: true }} }},
-    plugins: {{ title: {{ display: true, text: 'PR size (log scale)' }} }}
+    scales: {{ y: {{ type: 'logarithmic' }} }},
+    plugins: {{ legend: {{ display: false }}, tooltip: {{
+      callbacks: {{ label: (ctx) => ctx.raw.toLocaleString() + ' lines' }}
+    }} }}
   }}
 }});
 
-const scatterData = {scatter_json};
+// --- Prior Rust PRs ---
+new Chart(document.getElementById('rustPrChart'), {{
+  type: 'bar',
+  data: {{
+    labels: {pr_labels_json},
+    datasets: [{{ data: {rust_pr_json}, backgroundColor: {pr_colors_json} }}]
+  }},
+  options: {{
+    responsive: true,
+    scales: {{ y: {{ beginAtZero: true, ticks: {{ stepSize: 1 }} }} }},
+    plugins: {{ legend: {{ display: false }} }}
+  }}
+}});
+
+// --- Account Age ---
+new Chart(document.getElementById('ageChart'), {{
+  type: 'bar',
+  data: {{
+    labels: {pr_labels_json},
+    datasets: [{{ data: {age_json}, backgroundColor: {pr_colors_json} }}]
+  }},
+  options: {{
+    responsive: true,
+    scales: {{ y: {{ beginAtZero: true, title: {{ display: true, text: 'Days' }} }} }},
+    plugins: {{ legend: {{ display: false }} }}
+  }}
+}});
+
+// --- Scatter ---
+const scatterByTier = {scatter_by_tier_json};
 new Chart(document.getElementById('scatterChart'), {{
   type: 'bubble',
   data: {{
-    datasets: scatterData.map(d => ({{
-      label: d.label,
-      data: [{{ x: d.prs, y: d.repos, r: Math.min(Math.max(Math.sqrt(d.prs) * 2, 5), 40) }}],
-      backgroundColor: d.color + '99',
-      borderColor: d.color,
+    datasets: Object.entries(scatterByTier).map(([tier, points]) => ({{
+      label: tier,
+      data: points,
+      backgroundColor: TIER_COLORS[tier] + '99',
+      borderColor: TIER_COLORS[tier],
     }}))
   }},
   options: {{
     responsive: true,
     scales: {{
       x: {{ title: {{ display: true, text: 'PRs in 7-day window' }}, type: 'logarithmic' }},
-      y: {{ title: {{ display: true, text: 'Distinct repos targeted' }}, beginAtZero: true }}
+      y: {{ title: {{ display: true, text: 'Distinct repos' }}, beginAtZero: true }}
     }},
-    plugins: {{ title: {{ display: true, text: 'Author spray pattern (7 days before moderation)' }} }}
+    plugins: {{ tooltip: {{
+      callbacks: {{ label: (ctx) => ctx.raw.label + ': ' + ctx.raw.x + ' PRs, ' + ctx.raw.y + ' repos' }}
+    }} }}
   }}
 }});
 
+// --- Table ---
 const rows = {table_rows_json};
 const tbody = document.getElementById('tableBody');
 rows.forEach(r => {{
   const tr = document.createElement('tr');
-  const tierColor = r[10];
+  const tierColor = r[11];
   tr.innerHTML = `
     <td>${{r[0]}}</td>
     <td>${{r[1]}}</td>
     <td><span class="tier" style="background:${{tierColor}}">${{r[2]}}</span></td>
-    <td>${{r[3]}} / ${{r[4]}}</td>
+    <td>${{r[3].toLocaleString()}}</td>
+    <td>${{r[4].toLocaleString()}}</td>
     <td>${{r[5]}}</td>
     <td>${{r[6]}}</td>
     <td>${{r[7]}}</td>
     <td>${{r[8]}}</td>
-    <td>${{r[9]}}</td>
+    <td>${{r[10]}}</td>
   `;
   tbody.appendChild(tr);
 }});
@@ -808,23 +911,12 @@ rows.forEach(r => {{
         week_bans_json = serde_json::to_string(&week_bans)?,
         week_warnings_json = serde_json::to_string(&week_warnings)?,
         week_soft_json = serde_json::to_string(&week_soft)?,
-        size_labels_json = serde_json::to_string(&size_labels)?,
-        size_add_json = serde_json::to_string(&size_additions)?,
-        size_del_json = serde_json::to_string(&size_deletions)?,
-        size_tiers_json = serde_json::to_string(&size_tiers)?,
-        scatter_json = serde_json::to_string(
-            &author_scatter
-                .iter()
-                .map(|(label, (prs, repos, tier))| {
-                    serde_json::json!({
-                        "label": label,
-                        "prs": prs,
-                        "repos": repos,
-                        "color": tier_color(*tier),
-                    })
-                })
-                .collect::<Vec<_>>()
-        )?,
+        pr_labels_json = serde_json::to_string(&pr_labels)?,
+        pr_colors_json = serde_json::to_string(&pr_colors)?,
+        size_totals_json = serde_json::to_string(&size_totals)?,
+        rust_pr_json = serde_json::to_string(&rust_pr_counts)?,
+        age_json = serde_json::to_string(&account_ages)?,
+        scatter_by_tier_json = serde_json::to_string(&scatter_by_tier)?,
         table_rows_json = format!("[{}]", table_rows.join(",")),
     );
 
@@ -875,7 +967,7 @@ fn publish(data_dir: &Path) -> Result<()> {
             "gist",
             "create",
             "--desc",
-            "Slop PR Stats — rust-lang/rust (anonymized)",
+            "Moderation Action Stats — rust-lang/rust (anonymized)",
             report_path.to_str().unwrap(),
         ])
         .output()
