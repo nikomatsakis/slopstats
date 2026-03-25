@@ -21,9 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-action/setup@v1
-
       - name: Build slopstats
         run: cargo build --release
 
